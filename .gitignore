@@ -1,3 +1,7 @@
+# wj add
+model/Bert_ant/pytorch_model.bin
+.idea/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
