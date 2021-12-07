@@ -1,8 +1,7 @@
-import itertools
 import numpy as np
 import torch, pickle
 from transformers.pipelines import FillMaskPipeline
-from transformers import BertForMaskedLM
+from transformers import BertForMaskedLM, BertTokenizer
 
 
 class Glove(torch.nn.Module):
@@ -13,23 +12,16 @@ class Glove(torch.nn.Module):
         self.id2word = id2word
 
     def forward(self, x):
-        """x是一个list, 返回两两相似度的值"""
-        res = {}
+        # num(noun_list) * 2
         embed = self.embedding(x)
-        for i, j in itertools.combinations(range(embed.shape[1]), 2):
-            res[(i, j)] = torch.cosine_similarity(embed[:, i], embed[:, j], dim=1)
+        # 300 5000*300
+        res = torch.cosine_similarity(embed[0, 0, :].unsqueeze(0), embed[:, 1], dim=1)
         return res
 
-    def encoding(self, triples):
-        # 输入batch*n的字符 或者 id
-        input = []
-        for words in triples:
-            #             input.append([self.word2id[word] for word in words])
-            input.append([self.word2id[word.split(' ')[-1]] for word in words])
 
-        return torch.from_numpy(np.array(input))
 class POSVocab():
     """词表类 包含形容词词表和名词词表"""
+
     def __init__(self, tokenizer, adj_file, noun_file):
         self.tokenizer = tokenizer
 
@@ -43,6 +35,10 @@ class POSVocab():
 
         with open(self.vocab_file['noun'], 'rb') as f:
             self.words['noun'] = pickle.load(f)
+
+        # self.worod2id = {}
+        # self.worod2id['adj'] = {self.words['adj'][i]:i for i in range(len(self.words['adj']))}
+        # self.worod2id['noun'] = {self.words['noun'][i]:i for i in range(len(self.words['noun']))}
 
         self.mask = {}
         self.mask['adj'] = self.getVocabMask(tokenizer, self.vocab_file['adj'])
@@ -106,22 +102,18 @@ class MetaphorGenerator(FillMaskPipeline):
         return origin_scores, topk_tokens
 
 
-
-from utils import POSVocab, MetaphorGenerator
-from transformers import BertForMaskedLM, BertTokenizer
-import torch
-
-
 class PSGenerator(MetaphorGenerator):
     """pattern search方法的比喻生成器"""
+
     def __init__(self, bert_path='.\model\Bert_ant', glove_path='.\model\glove'):
         model = BertForMaskedLM.from_pretrained(bert_path)
         tokenizer = BertTokenizer.from_pretrained(bert_path)
         vocabs = POSVocab(tokenizer, adj_file='vocab/adj_4800', noun_file="vocab/noun_concrete")
-        device = None
+        device = torch.device("cpu")
         if torch.cuda.is_available():
             device = torch.device("cuda:0")
         self.glove = torch.load(glove_path)
+        self.glove.embedding.to(device)
         super().__init__(model, tokenizer, vocabs, device)
 
     def SI_pattern(self, ele, mask_token):
@@ -146,7 +138,6 @@ class PSGenerator(MetaphorGenerator):
         logit[:, idx[0]] = torch.log(tmp)
         return torch.mean(logit, dim=0)
 
-
     def SI(self, tenor, vehicle, topk=15):
         input = [[tenor, vehicle, None]]
         return self.generate(input, self.SI_score, self.SI_pattern, topk)[1][0]
@@ -165,22 +156,26 @@ class PSGenerator(MetaphorGenerator):
         # 喻体的logit
         pos_vocab = kwargs['pos_vocab']
         mode = kwargs['mode']
+
         # 获取本体与所有名词之间的余弦距离
-        tenor = kwargs['ele'][0]
-        noun_list = pos_vocab.words[mode]
+        tenor = kwargs['ele'][0].split(' ')[-1]  # 多个词的话 只对最后一个计算相似度
+        if tenor not in self.glove.id2word:
+            noun_list = pos_vocab.words[mode]
+        else:
+            tenor_id = self.glove.word2id[tenor]
+            input = torch.from_numpy(np.array([
+                [tenor_id, self.glove.word2id[w]] for w in pos_vocab.words[mode]
+            ])).to(self.device)
+            sims = self.glove(input)
+            assert len(sims) == len(self.pos_vocab.words[mode])
+            noun_list = [
+                self.pos_vocab.words[mode][i]
+                for i in range(len(sims)) if sims[i] <= 0.5
+            ]
+        mask = [False] * len(self.tokenizer.vocab)
+        for w in noun_list:
+            mask[self.tokenizer.vocab[w]] = True
 
-        inputs = []
-        for noun in noun_list:
-            if noun in self.glove.id2word:
-                inputs.append([tenor, noun])
-
-        # 过滤与本体相近的词, 剩下所有的词都是可能的候选词
-        sim = self.glove(self.glove.encoding(inputs))[(0,1)] # todo 一个个求太慢 弄成缓存; 如果vehicle不在glove里, 可能报错
-        mask = [False] * len(pos_vocab.tokenizer.vocab)
-        for i in range(len(inputs)):
-            if sim[i]<=0.5:
-                word = inputs[i][1]
-                mask[self.tokenizer.vocab[word]] = True
         mask = torch.tensor(mask)
         logit.masked_fill_(~mask, -1e9)
 
@@ -194,5 +189,4 @@ class PSGenerator(MetaphorGenerator):
 
     def SG(self, tenor, attr, topk=15):
         input = [[tenor, None, attr]]
-        return self.generate(input, self.SG_score, self.SG_pattern, topk)[1]
-
+        return self.generate(input, self.SG_score, self.SG_pattern, topk)[1][0]
